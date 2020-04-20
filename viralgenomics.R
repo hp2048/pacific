@@ -61,20 +61,12 @@ selectrepresentative <- function(tid) {
   }
 }
 
-##download genome fasta file if it doesnt exist
-downloadgb <- function(gbftppath) {
-  genbankdir <- "/media/dstore/covid19/ncbi-genbank"
-  g <- str_match(gbftppath, "\\S+\\/(\\S+)")
-  localpath <- paste(genbankdir,"/",g[[2]],"_genomic.fna.gz", sep = "")
-  remotepath <- paste(g[[1]],"/",g[[2]],"_genomic.fna.gz", sep = "")
-  #following was tried but it was too slow. Perhaps better to use parallel or xargs
-  #if(!file.exists(localpath)){
-  #  print(paste("Downloading", g[[2]]))
-  #  fileurl <- paste(g[[1]],"/",g[[2]],"_genomic.fna.gz", sep = "")
-  #  download.file(fileurl, localpath)
-  #}
-}
+workingdir <- "/media/dstore/covid19/"
+genbankdir <- "/media/dstore/covid19/ncbi-genbank/"
+taxonomydir <- "/media/dstore/covid19/ncbi-taxonomy/"
 
+
+##download genome annotations and 
 
 processmeta <- cmpfun(processmeta)
 getSummaryInfo <- cmpfun(getSummaryInfo)
@@ -87,7 +79,6 @@ downloadgb <- cmpfun(downloadgb)
 viralgenomes <- entrez_search("assembly", 'txid10239[Organism:exp] & "latest genbank"[filter] & "complete genome"[filter] NOT anomalous[filter] NOT "derived from surveillance project"[filter]', use_history = T)
 maxrecords <- 500
 iterations <- as.integer(viralgenomes$count/maxrecords)
-start <- nrow(sinfo)/maxrecords
 
 sinfo <- NULL
 for (i in 0:iterations) {
@@ -144,6 +135,8 @@ colnames(rankedlineage) <- c("taxid", "tax_name", "species", "genus", "family", 
 system('sed "s/\t//g" host.dmp >host.dmp.tmp')
 host <- read.table("host.dmp.tmp", sep="|", quote ="")
 colnames(host) <- c("taxid", "potentialhosts")
+#host <- host %>% mutate(potentialhosts = case_when( .$potentialhosts == "vertebrates,human" ~ "human,vertebrates", is.na(.$potentialhosts) ~ "Unknown", .$potentialhosts == "vertebrates,invertebrates,human" ~ "human,invertebrates,vertebrates", .$potentialhosts == "invertebrates,vertebrates" ~ "vertebrates,invertebrates", TRUE ~ as.character(.$potentialhosts))) %>% mutate(potentialhosts = as.factor(potentialhosts))
+
 ##merged lineage information
 
 y <- merge(y, rankedlineage, by.x = "taxid", by.y = "taxid", all.x = T)
@@ -160,15 +153,81 @@ spectab <- data.frame(table(y$taxid))
 colnames(spectab) <- c("taxid", "genomes")
 spectab$taxid <- as.integer(as.character(spectab$taxid))
 
-
 spectab$representative <- unlist(lapply(spectab$taxid, selectrepresentative))
 y <- y %>% mutate(isrep = case_when( .$uid %in% spectab$representative ~ "taxrep", TRUE ~ "nontaxrep"))
 
-cores2use <- detectCores() / 2
-cluster <- makeCluster(cores2use, type="FORK")
-registerDoParallel(cluster)
-x <- parLapply(cluster, y$ftppath_genbank, downloadgb)
-stopCluster(cluster)
+checklocalfiles <- function(x) {
+  propertylist <- x["propertylist"]
+  ftppath <- x["ftppath_genbank"]
+  dcmds <- vector()
+  #genome file
+  genomedir <- "/media/dstore/covid19/ncbi.genbank.genomes/"
+  localfile <- paste(genomedir, str_match(ftppath, "\\S+\\/(\\S+)")[,2], "_genomic.fna.gz", sep = "")
+  remotefile <- paste(ftppath, str_match(ftppath, "\\S+\\/(\\S+)")[,2], "_genomic.fna.gz" , sep = "")
+  if (! file.exists(localfile)){
+    dcmds <- append(dcmds, paste("wget -q --continue -O", localfile, remotefile))
+  }
+  #other annotations
+  if (grepl("genbank_has_annotation", propertylist)){
+    ##cds file
+    cdsdir <- "/media/dstore/covid19/ncbi.genbank.cds/"
+    localfile <- paste(cdsdir, str_match(ftppath, "\\S+\\/(\\S+)")[,2], "_cds_from_genomic.fna.gz", sep = "")
+    remotefile <- paste(ftppath, str_match(ftppath, "\\S+\\/(\\S+)")[,2], "_cds_from_genomic.fna.gz" , sep = "")
+    if (! file.exists(localfile)){
+      dcmds <- append(dcmds, paste("wget -q --continue -O", localfile, remotefile))
+    }
+    ## protein file
+    proteindir <- "/media/dstore/covid19/ncbi.genbank.proteins/"
+    localfile <- paste(proteindir, str_match(ftppath, "\\S+\\/(\\S+)")[,2], "_protein.faa.gz", sep = "")
+    remotefile <- paste(ftppath, str_match(ftppath, "\\S+\\/(\\S+)")[,2], "_protein.faa.gz" , sep = "")
+    if (! file.exists(localfile)){
+      dcmds <- append(dcmds, paste("wget -q --continue -O", localfile, remotefile))
+    }
+    ## gff file
+    gffdir <- "/media/dstore/covid19/ncbi.genbank.gff/"
+    localfile <- paste(gffdir, str_match(ftppath, "\\S+\\/(\\S+)")[,2], "_genomic.gff.gz", sep = "")
+    remotefile <- paste(ftppath, str_match(ftppath, "\\S+\\/(\\S+)")[,2], "_genomic.gff.gz" , sep = "")
+    if (! file.exists(localfile)){
+      dcmds <- append(dcmds, paste("wget -q --continue -O", localfile, remotefile))
+    }
+  }
+  return(dcmds)
+}
+
+x <- apply(y, 1, checklocalfiles)
+x <- unlist(x)
+if ( ! is_empty(x)) {
+  fileConn<-file("/media/dstore/covid19/genbankgenomedownloadcmds.txt")
+  writeLines(x, fileConn)
+  close(fileConn)
+}
+ncore <- detectCores()
+system(paste("parallel -j",ncore,"</media/dstore/covid19/genbankgenomedownloadcmds.txt"))
+
+processfasta <- function(x) {
+  ftppath <- x["ftppath_genbank"]
+  genomedir <- "/media/dstore/covid19/ncbi.genbank.genomes/"
+  fid <- str_match(ftppath, "\\S+\\/(\\S+)")[,2]
+  localfile <- paste(genomedir, fid, "_genomic.fna.gz", sep = "")
+  s <- readBStringSet(localfile)
+  l <- data.frame(letterFrequency(s,c("A","C","G","T")))
+  info <- data.frame(uid = as.integer(x["uid"]), gbasm = fid, seqid = as.character(names(s)), seqlen = as.integer(width(s)))
+  info <- cbind(info, l)
+  return(info)
+}
+##read in genome fasta files, seqids, lengths, gc contents, number of sequences
+ginfo <- do.call("rbind", apply(y, 1, processfasta))
+y <- merge(y,ginfo %>% group_by(uid) %>% summarise(gc = sum(G,C)/sum(A,C,G,T), nseq = n()) %>% select(uid,gc,nseq), by.x = "uid", by.y = "uid")
+
+#boxplots to show GC contents for different groupings (family, order, class, potential hosts)
+#y %>% filter(isrep=="taxrep") %>% ggplot(aes(x=family, y=gc)) + geom_boxplot() + geom_jitter(alpha=0.2) + theme_bw() + theme(axis.text = element_text(angle=90,hjust=1))
+
+
+#cores2use <- detectCores() / 2
+#cluster <- makeCluster(cores2use, type="FORK")
+#registerDoParallel(cluster)
+#x <- parLapply(cluster, y$ftppath_genbank, downloadgb)
+#stopCluster(cluster)
 
 ##create sqlite database for later use
 db = dbConnect(SQLite(), dbname="/media/dstore/covid19/ncbi.virus.20200409.sqlite")

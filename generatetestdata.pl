@@ -17,7 +17,7 @@ while (<F>){
 	chomp $_;
 	my @a = split ("\t", $_);
 	next if ($a[0] eq "V1");
-	push(@{$ginfo{"$a[3].$a[0]"."_$a[1]"}}, $a[2]);
+	push(@{$ginfo{$a[0]}}, $a[2]);
 }
 close F;
 print "done reading info file\n";
@@ -43,7 +43,7 @@ my @groups = ();
 open (F, "<$selectionfile") or die $!; ##a file of the format Cornidovirineae:28295.GCA_900197455.1_PEDV_GER_L01061-K07_15-03_2015.d30.l150.fa
 while (<F>){
 	chomp $_;
-	$_=~/(\S+):(\d+\.G\S+).d30.l150.fa/;
+	$_=~/(\S+):(G\S+)/;
 	my $group = $1;
 	my $genome = $2;
 	push(@{$selections{$group}},  $genome);
