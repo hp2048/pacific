@@ -79,7 +79,7 @@ for (my $id = 1; $id<= $totaldset; $id++){
 				while (length($thisseq) < $maxseqlen) {
 					$thisseq .= $characters[int(rand(4))];
 				}
-				print O "\@tdi$id:$sel:$sel:$r/$reads2select\n$thisseq\n+\n".("I" x $maxseqlen)."\n";
+				print O "\@tdi$id:$sel:$sel:1:0:$r:$reads2select\n$thisseq\n+\n".("I" x $maxseqlen)."\n";
 				$counter{$sel}{$sel}++;
 			}
 		}
@@ -95,7 +95,7 @@ for (my $id = 1; $id<= $totaldset; $id++){
           $thisseq = reverse ($thisseq);
           $thisseq =~ tr/ACGT/TGCA/;
         }
-				print O "\@tdi$id:$sel:$g:$r/$reads2select\n$thisseq\n+\n".("I" x $maxseqlen)."\n";
+				print O "\@tdi$id:$sel:$g:$strand:$thisstart:$r:$reads2select\n$thisseq\n+\n".("I" x $maxseqlen)."\n";
 				$counter{$sel}{$g}++;
 			}
 		}
