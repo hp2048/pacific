@@ -10,6 +10,8 @@ library(RCurl)
 library(ggthemes)
 library(ggrepel)
 library(doParallel)
+library(gtools)
+library(Biostrings)
 
 unescape_html <- function(str){
   xt <- xml_text(read_html(paste0("<x>", str, "</x>")))
@@ -209,7 +211,7 @@ processfasta <- function(x) {
   genomedir <- "/media/dstore/covid19/ncbi.genbank.genomes/"
   fid <- str_match(ftppath, "\\S+\\/(\\S+)")[,2]
   localfile <- paste(genomedir, fid, "_genomic.fna.gz", sep = "")
-  s <- readBStringSet(localfile)
+  s <- readDNAStringSet(localfile)
   l <- data.frame(letterFrequency(s,c("A","C","G","T")))
   info <- data.frame(uid = as.integer(x["uid"]), gbasm = fid, seqid = as.character(names(s)), seqlen = as.integer(width(s)))
   info <- cbind(info, l)
@@ -218,6 +220,21 @@ processfasta <- function(x) {
 ##read in genome fasta files, seqids, lengths, gc contents, number of sequences
 ginfo <- do.call("rbind", apply(y, 1, processfasta))
 y <- merge(y,ginfo %>% group_by(uid) %>% summarise(gc = sum(G,C)/sum(A,C,G,T), nseq = n()) %>% select(uid,gc,nseq), by.x = "uid", by.y = "uid")
+
+getkmers <- function(x) {
+  width<-9
+  s <- readDNAStringSet(x)
+  kfreq <- oligonucleotideFrequency(s,width)
+  return(kfreq)
+}
+
+kmerprobes <- permutations(4,9,c("A","C","G","T"), repeats.allowed = T)
+kmerprobes <- apply(kmerprobes, 1, paste, collapse="")
+kmerprobes <- DNAStringSet(kmerprobes)
+
+
+
+
 
 #boxplots to show GC contents for different groupings (family, order, class, potential hosts)
 #y %>% filter(isrep=="taxrep") %>% ggplot(aes(x=family, y=gc)) + geom_boxplot() + geom_jitter(alpha=0.2) + theme_bw() + theme(axis.text = element_text(angle=90,hjust=1))
