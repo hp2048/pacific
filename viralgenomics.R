@@ -2,6 +2,8 @@ library(tidyverse)
 library(rentrez)
 library(xml2)
 library(XML)
+library(Biostrings)
+
 library(rbenchmark)
 library(compiler)
 library(RSQLite)
@@ -11,7 +13,6 @@ library(ggthemes)
 library(ggrepel)
 library(doParallel)
 library(gtools)
-library(Biostrings)
 
 unescape_html <- function(str){
   xt <- xml_text(read_html(paste0("<x>", str, "</x>")))
@@ -24,7 +25,7 @@ simplifycolumn <- function(x) {
 
 getSummaryInfo <- function(iteration, webhistory, maxrecords) {
   print(paste("processing", iteration, "iteration"))
-  sumInfo <- entrez_summary("assembly",web_history = webhistory, retstart = iteration*maxrecords+1, retmax=maxrecords)
+  sumInfo <- entrez_summary("assembly",web_history = webhistory, retstart = iteration*maxrecords+1, retmax=maxrecords, always_return_list = T)
   sumtable <- data.frame(matrix(extract_from_esummary(sumInfo, names(sumInfo[[1]])), nrow = length(sumInfo), byrow = T))
   colnames(sumtable) <- names(sumInfo[[1]])
   return(sumtable)
@@ -32,13 +33,16 @@ getSummaryInfo <- function(iteration, webhistory, maxrecords) {
 
 processmeta <- function(x) {
   #a <- as_list(read_xml(unescape_html(x)))
-  a <- xmlToList(xmlParse(paste("<doc>",unescape_html(x),"</doc>"), asText = T))
-  a <- a$meta[["Stats"]]
-  a <- as.data.frame(t(matrix(unlist(a), nrow = 3)))
+  a <- xmlToList(x)
+  a <- as.data.frame(t(matrix(unlist(a$Stats), nrow = 3)))
   row.names(a) <- paste(a$V2,a$V3,sep=".")
   a <- select(a,V1)
   return(a)
 }
+
+##following conditions to be tested
+##https://www.ncbi.nlm.nih.gov/assembly/help/anomnotrefseq/
+##excluded-from-refseq, suppressed_refseq,  can not be excluded from refseq
 
 selectrepresentative <- function(tid) {
   ##if only one genome for the taxid, use it as representative
@@ -63,49 +67,101 @@ selectrepresentative <- function(tid) {
   }
 }
 
-workingdir <- "/media/dstore/covid19/"
-genbankdir <- "/media/dstore/covid19/ncbi-genbank/"
-taxonomydir <- "/media/dstore/covid19/ncbi-taxonomy/"
+getlocalpaths <- function(x){
+  #ncbidatadir <- "/media/dstore/covid19/ncbi-genomes-2020-05-07/"
+  localfile <- paste(ncbidatadir, str_match(x, "\\S+\\/(\\S+)")[,2], "_genomic.fna.gz", sep = "")
+  genome <- ifelse(file.exists(localfile), localfile, "unavailable")
+  localfile <- paste(ncbidatadir, str_match(x, "\\S+\\/(\\S+)")[,2], "_genomic.gff.gz", sep = "")
+  gff <- ifelse(file.exists(localfile), localfile, "unavailable")
+  localfile <- paste(ncbidatadir, str_match(x, "\\S+\\/(\\S+)")[,2], "_cds_from_genomic.fna.gz", sep = "")
+  cds <- ifelse(file.exists(localfile), localfile, "unavailable")
+  localfile <- paste(ncbidatadir, str_match(x, "\\S+\\/(\\S+)")[,2], "_protein.faa.gz", sep = "")
+  proteins <- ifelse(file.exists(localfile), localfile, "unavailable")
+  return(c(genome,gff,cds,proteins))  
+}
 
+#workingdir <- "/media/dstore/covid19/"
+#genbankdir <- "/media/dstore/covid19/ncbi-genbank/"
+#taxonomydir <- "/media/dstore/covid19/ncbi-taxonomy/"
 
-##download genome annotations and 
+##directory management
+ncbidatadir <- "/media/dstore/covid19/ncbidatadir"
+workingdir <- "/media/dstore/covid19/viralgenomics"
 
-processmeta <- cmpfun(processmeta)
-getSummaryInfo <- cmpfun(getSummaryInfo)
-simplifycolumn <- cmpfun(simplifycolumn)
-unescape_html <- cmpfun(unescape_html)
-selectrepresentative <- cmpfun(selectrepresentative)
-downloadgb <- cmpfun(downloadgb)
+dir.create(ncbidatadir, showWarnings = F, recursive = T)
+dir.create(workingdir, showWarnings = F, recursive = T)
+
+setwd(workingdir)
+
+##load data objects
+if (file.exists("esearchresults.RData")) {
+  load("esearchresults.RData")
+} else {
+  esearchresults <- NULL
+}
 
 ##get a list of viral genome assembly from NCBI
 viralgenomes <- entrez_search("assembly", 'txid10239[Organism:exp] & "latest genbank"[filter] & "complete genome"[filter] NOT anomalous[filter] NOT "derived from surveillance project"[filter]', use_history = T)
-maxrecords <- 500
-iterations <- as.integer(viralgenomes$count/maxrecords)
+currentuids <- entrez_fetch("assembly", web_history = viralgenomes$web_history, rettype="uilist", retmode = "text")
+currentuids <- unlist(strsplit(currentuids,"\\n"))
 
-sinfo <- NULL
-for (i in 0:iterations) {
-  tmp <- getSummaryInfo(iteration = i, webhistory = viralgenomes$web_history, maxrecords=maxrecords)
-  sinfo <- bind_rows(sinfo, tmp)
+##if esearchresults is null
+if(is.null(esearchresults)){
+  maxrecords <- 500
+  iterations <- as.integer(viralgenomes$count/maxrecords)
+  for (i in 0:iterations) {
+    tmp <- getSummaryInfo(iteration = i, webhistory = viralgenomes$web_history, maxrecords=maxrecords)
+    esearchresults <- bind_rows(esearchresults, tmp)
+  }
 }
 
-y <- sinfo
+##check and process for new and depricated entries
+new <- currentuids[! currentuids %in% esearchresults$uid]
+depricated <- esearchresults$uid[! esearchresults$uid %in% currentuids]
+
+if (length(depricated) > 0) {
+  esearchresults <- esearchresults[! esearchresults$uid %in% depricated,]
+}
+
+if (length(new) > 0){
+  maxrecords <- 300 ##this limit is tested previously, may need to change it in the future if something changes
+  for (i in 0:as.integer(length(new)/maxrecords)){
+    start <- i*maxrecords+1
+    end <- ifelse(i*maxrecords+maxrecords > length(new), length(new), i*maxrecords+maxrecords)
+    sumInfo <- entrez_summary("assembly",id = new[start:end], always_return_list = T)
+    sumtable <- data.frame(matrix(extract_from_esummary(sumInfo, names(sumInfo[[1]])), nrow = length(sumInfo), byrow = T))
+    colnames(sumtable) <- names(sumInfo[[1]])
+    esearchresults <- bind_rows(esearchresults,sumtable)
+  }
+}
+
+save(esearchresults, file="esearchresults.RData")
+
+##load data objects
+if (file.exists("virusinfo.RData")) {
+  load("virusinfo.RData")
+} else {
+  virusinfo <- NULL
+}
+
+##process esearch results to attach to virusinfo
+if (is.null(virusinfo)){
+  y <- esearchresults
+} else {
+  y <- esearchresults[esearchresults$uid %in% new,]
+}
+
 ##property list is not ordered so just paste it together
 y$propertylist <- sapply(y$propertylist, paste, collapse =":")
-
-##process meta column to extract stats information out of it
-x <- do.call("cbind",lapply(y$meta, processmeta))
-x <- t(x)
-x <- type.convert(x)
-y <- cbind(y, x)
-y$meta <- unlist(lapply(y$meta, unescape_html)) ##need to sanitise this. runs twice
-
+##escape for html characters in metadata column
+y$meta <- sapply(y$meta, unescape_html)
 ##process multi item columns
 y <- y %>% unnest_wider(col = synonym, names_sep = ".", names_repair = "universal")
 y <- y %>% unnest_wider(col = anomalouslist, names_sep = ".", names_repair = "universal")
 y <- y %>% unnest_wider(col = biosource, names_sep = ".", names_repair = "universal")
 y <- y %>% unnest_wider(col = gb_bioprojects, names_sep = ".", names_repair = "universal")
 y <- y %>% unnest_wider(col = rs_bioprojects, names_sep = ".", names_repair = "universal")
-y <- y %>% unnest_wider(col = biosource.infraspecieslist, names_sep = ".", names_repair = "universal")
+y <- y %>% unnest_wider(col = biosource.infraspecieslist, names_sep = ".", names_repair = "universal") ##column doesnt exist and gives error fix it later
 ##unlist column items lists
 y <- data.frame(apply(y,2, simplifycolumn))
 ##remove sortorder column
@@ -114,6 +170,16 @@ y <- select(y, -sortorder, -biosource.infraspecieslist.)
 y <- type.convert(y)
 ##date columns are not formatted correctly using type convert so take care of them
 y <- mutate_at(y, colnames(y)[grep("date", colnames(y))], as.Date)
+##get filebase for genomes
+y$filebase <- str_match(y$ftppath_genbank, "\\S+\\/(\\S+)")[,2]
+
+
+##may need to remove this as no information is being gathered from here
+##process meta column to extract stats information out of it
+#x <- do.call("cbind", lapply(y$meta[1:100], processmeta))
+#x <- t(x)
+#x <- type.convert(x)
+#y <- cbind(y, x)
 
 
 ##when dates are written in sqlite table, they are written as real numbers
@@ -126,8 +192,8 @@ y <- mutate_at(y, colnames(y)[grep("date", colnames(y))], as.Date)
 ##There can be more than one assembly per taxid, probably because of different strains
 
 ##get Lineage information
-download.file("https://ftp.ncbi.nih.gov/pub/taxonomy/new_taxdump/new_taxdump.tar.gz", "/media/dstore/covid19/ncbitaxdmp/new_taxdump.tar.gz")
-setwd("/media/dstore/covid19/ncbitaxdmp/")
+setwd(ncbidatadir)
+download.file("https://ftp.ncbi.nih.gov/pub/taxonomy/new_taxdump/new_taxdump.tar.gz", "new_taxdump.tar.gz")
 system("tar -xvzf new_taxdump.tar.gz")
 ##lineage information
 system('sed "s/\t//g" rankedlineage.dmp | sed "s/\'//g" >rankedlineage.dmp.tmp')
@@ -137,16 +203,13 @@ colnames(rankedlineage) <- c("taxid", "tax_name", "species", "genus", "family", 
 system('sed "s/\t//g" host.dmp >host.dmp.tmp')
 host <- read.table("host.dmp.tmp", sep="|", quote ="")
 colnames(host) <- c("taxid", "potentialhosts")
-#host <- host %>% mutate(potentialhosts = case_when( .$potentialhosts == "vertebrates,human" ~ "human,vertebrates", is.na(.$potentialhosts) ~ "Unknown", .$potentialhosts == "vertebrates,invertebrates,human" ~ "human,invertebrates,vertebrates", .$potentialhosts == "invertebrates,vertebrates" ~ "vertebrates,invertebrates", TRUE ~ as.character(.$potentialhosts))) %>% mutate(potentialhosts = as.factor(potentialhosts))
 
 ##merged lineage information
-
 y <- merge(y, rankedlineage, by.x = "taxid", by.y = "taxid", all.x = T)
 y <- merge(y, host, by.x = "taxid", by.y = "taxid", all.x = T)
 y <- droplevels(y)
 y <- select(y, -empty)
-
-
+rm(rankedlineage,host)
 ##consolidate host information
 y <- y %>% mutate(potentialhosts = case_when( .$potentialhosts == "vertebrates,human" ~ "human,vertebrates", is.na(.$potentialhosts) ~ "Unknown", .$potentialhosts == "vertebrates,invertebrates,human" ~ "human,invertebrates,vertebrates", .$potentialhosts == "invertebrates,vertebrates" ~ "vertebrates,invertebrates", TRUE ~ as.character(.$potentialhosts))) %>% mutate(potentialhosts = as.factor(potentialhosts))
 
@@ -154,10 +217,174 @@ y <- y %>% mutate(potentialhosts = case_when( .$potentialhosts == "vertebrates,h
 spectab <- data.frame(table(y$taxid))
 colnames(spectab) <- c("taxid", "genomes")
 spectab$taxid <- as.integer(as.character(spectab$taxid))
-
-spectab$representative <- unlist(lapply(spectab$taxid, selectrepresentative))
+spectab$representative <- sapply(spectab$taxid, selectrepresentative)
 y <- y %>% mutate(isrep = case_when( .$uid %in% spectab$representative ~ "taxrep", TRUE ~ "nontaxrep"))
 
+virusinfo <- y
+setwd(workingdir)
+save(virusinfo, file="virusinfo.RData")
+
+##do the following for cds, proteins and gff files later
+tarfile <- "genome_assemblies_genome_fasta.tar"
+extension <- "_genomic.fna.gz"
+filespresent <- gsub("\\S+\\/", "", untar(tarfile, list=T))
+expectedfiles <- paste(y$filebase,extension,sep="")
+toadd <- gsub(extension,"",expectedfiles[! expectedfiles %in% filespresent])
+if (length(toadd) > 0) {
+  toadd <- y %>% filter(filebase %in% toadd) %>% select(ftppath_genbank,filebase)
+  toadd <- paste(paste(toadd$ftppath_genbank,toadd$filebase,sep="/"), extension, sep="")
+  for (i in toadd) { download.file(i,str_match(i, "\\S+\\/(\\S+)")[,2], quiet = T) }
+  toadd <- str_match(toadd, "\\S+\\/(\\S+)")[,2]
+  for (i in toadd) { system(paste("tar --append --file=", tarfile, " ", i, sep = "")) }
+  file.remove(toadd)
+}
+toremove <- filespresent[! filespresent %in% expectedfiles]
+if (length(toremove)>0){
+  for (i in toremove) { system(paste("tar --delete --file=", tarfile, " ", i, sep = ""))}
+}
+##for protein files
+tarfile <- "genome_assemblies_prot_fasta.tar"
+extension <- "_protein.faa.gz"
+filespresent <- gsub("\\S+\\/", "", untar(tarfile, list=T))
+expectedfiles <- paste(y$filebase,extension,sep="")
+toadd <- gsub(extension,"",expectedfiles[! expectedfiles %in% filespresent])
+toadd <- y %>% filter(filebase %in% toadd & grepl("genbank_has_annotation", propertylist)) %>% .$filebase
+if (length(toadd) > 0) {
+  toadd <- y %>% filter(filebase %in% toadd) %>% select(ftppath_genbank,filebase)
+  toadd <- paste(paste(toadd$ftppath_genbank,toadd$filebase,sep="/"), extension, sep="")
+  for (i in toadd) { 
+    tryCatch(download.file(i,str_match(i, "\\S+\\/(\\S+)")[,2], quiet = T), 
+    error = function(e) print(paste(i, 'did not work out'))) 
+  }
+  toadd <- str_match(toadd, "\\S+\\/(\\S+)")[,2]
+  for (i in toadd) { system(paste("tar --append --file=", tarfile, " ", i, sep = "")) }
+  file.remove(toadd)
+}
+toremove <- filespresent[! filespresent %in% expectedfiles]
+if (length(toremove)>0){
+  for (i in toremove) { system(paste("tar --delete --file=", tarfile, " ", i, sep = ""))}
+}
+
+##for CDS files
+tarfile <- "genome_assemblies_cds_fasta.tar"
+extension <- "_cds_from_genomic.fna.gz"
+filespresent <- gsub("\\S+\\/", "", untar(tarfile, list=T))
+expectedfiles <- paste(y$filebase,extension,sep="")
+toadd <- gsub(extension,"",expectedfiles[! expectedfiles %in% filespresent])
+toadd <- y %>% filter(filebase %in% toadd & grepl("genbank_has_annotation", propertylist)) %>% .$filebase
+if (length(toadd) > 0) {
+  toadd <- y %>% filter(filebase %in% toadd) %>% select(ftppath_genbank,filebase)
+  toadd <- paste(paste(toadd$ftppath_genbank,toadd$filebase,sep="/"), extension, sep="")
+  for (i in toadd) { 
+    tryCatch(download.file(i,str_match(i, "\\S+\\/(\\S+)")[,2], quiet = T), 
+             error = function(e) print(paste(i, 'did not work out'))) 
+  }
+  toadd <- str_match(toadd, "\\S+\\/(\\S+)")[,2]
+  for (i in toadd) { system(paste("tar --append --file=", tarfile, " ", i, sep = "")) }
+  file.remove(toadd)
+}
+toremove <- filespresent[! filespresent %in% expectedfiles]
+if (length(toremove)>0){
+  for (i in toremove) { system(paste("tar --delete --file=", tarfile, " ", i, sep = ""))}
+}
+
+##for gff files
+tarfile <- "genome_assemblies_genome_gff.tar"
+extension <- "_genomic.gff.gz"
+filespresent <- gsub("\\S+\\/", "", untar(tarfile, list=T))
+expectedfiles <- paste(y$filebase,extension,sep="")
+toadd <- gsub(extension,"",expectedfiles[! expectedfiles %in% filespresent])
+toadd <- y %>% filter(filebase %in% toadd & grepl("genbank_has_annotation", propertylist)) %>% .$filebase
+if (length(toadd) > 0) {
+  toadd <- y %>% filter(filebase %in% toadd) %>% select(ftppath_genbank,filebase)
+  toadd <- paste(paste(toadd$ftppath_genbank,toadd$filebase,sep="/"), extension, sep="")
+  for (i in toadd) { 
+    tryCatch(download.file(i,str_match(i, "\\S+\\/(\\S+)")[,2], quiet = T), 
+             error = function(e) print(paste(i, 'did not work out'))) 
+  }
+  toadd <- str_match(toadd, "\\S+\\/(\\S+)")[,2]
+  for (i in toadd) { system(paste("tar --append --file=", tarfile, " ", i, sep = "")) }
+  file.remove(toadd)
+}
+toremove <- filespresent[! filespresent %in% expectedfiles]
+if (length(toremove)>0){
+  for (i in toremove) { system(paste("tar --delete --file=", tarfile, " ", i, sep = ""))}
+}
+
+genomefiles <- untar("genome_assemblies_genome_fasta.tar", list=T)
+
+
+
+#x <- bind_cols(lapply(y$ftppath_genbank, getlocalpaths))
+#x <- t(x)
+#colnames(x) <- c("genome","gff","cds","proteins")
+#x <- data.frame(x) %>% mutate_all(as.character)
+#y <- cbind(y, x)
+
+##
+getgenomeseqproperties <- function(x) {
+  filepath <- x
+  filebase <- gsub("_genomic.fna.gz","",x)
+  untar("genome_assemblies_genome_fasta.tar",files=c(x))
+  info<-NULL
+  s <- readDNAStringSet(filepath)
+  l <- data.frame(letterFrequency(s,c("A","C","G","T")))
+  info <- data.frame(filebase = filebase, seqid = as.character(names(s)), seqlen = as.integer(width(s)))
+  info <- cbind(info, l)
+  file.remove(x)
+  return(info)
+}
+
+seqinfo <- bind_rows(lapply(genomefiles,getgenomeseqproperties))
+
+
+getkmers <- function(x) {
+  width<-9
+  s <- readDNAStringSet(x)
+  kfreq <- oligonucleotideFrequency(s,width)
+  return(colSums(kfreq))
+}
+
+
+
+y <- y %>% filter(genome!="unavailable")
+
+
+kinfo <- do.call("rbind",lapply(y$genome[1:maxrecords], getkmers))
+write.table(kinfo, "kmercounts.csv", col.names = T, quote = F, sep = ",", row.names = y$genome[1:maxrecords])
+for (i in 1:iterations) {
+  start <- i*maxrecords+1
+  end <- ifelse(start + maxrecords - 1 <= nrow(y),  start + maxrecords - 1, nrow(y))
+  print(paste("processing", i, "iteration", start, end))
+  kinfo <- do.call("rbind",lapply(y$genome[start:end], getkmers))
+  print("Done counting kmers")
+  write.table(kinfo, "kmercounts.csv", col.names = F, quote = F, sep = ",", row.names = y$genome[start:end], append = T)
+  print("Done writing to file")
+}
+
+kmer <- read.big.matrix("kmercounts.subset.csv", type = "short", sep = ",", binarydescriptor = T, has.row.names = T, header = T, backingfile = "kmer.bigmatrix", descriptorfile = "kmer.bigmatrix.desc")
+#k <- kmer
+kmer <- kmer[1:50,]
+kdist <- filebacked.big.matrix(nrow(kmer),nrow(kmer), type = "double", backingfile = "kmerdist.bk", descriptorfile = "kmerdist.desc")
+
+#getdistance <- function(i,j){
+#  shared <- kmer[i,]>0 & kmer[j,]>0
+#  kdist[i,j] <- kdist[j,i] <- sum(kmer[i,][shared], kmer[j,][shared]) / (sum(kmer[i,]) + sum(kmer[j,]))
+#}
+
+for (i in 1:nrow(kmer)) {
+  for (j in i:nrow(kmer)) {
+    shared <- kmer[i,]>0 & kmer[j,]>0
+    kdist[i,j] <- kdist[j,i] <- sum(kmer[i,][shared], kmer[j,][shared]) / (sum(kmer[i,]) + sum(kmer[j,]))
+  }
+}
+
+lapply(c(1:10), testf, y=c(1:10))
+
+testf <- function(i,j){
+  shared <- kmer[i,]>0 & kmer[j,]>0
+  kdist[i,j] <- kdist[j,i] <- sum(kmer[i,][shared], kmer[j,][shared]) / (sum(kmer[i,]) + sum(kmer[j,]))
+}
 checklocalfiles <- function(x) {
   propertylist <- x["propertylist"]
   ftppath <- x["ftppath_genbank"]
@@ -165,8 +392,8 @@ checklocalfiles <- function(x) {
   #genome file
   genomedir <- "/media/dstore/covid19/ncbi.genbank.genomes/"
   localfile <- paste(genomedir, str_match(ftppath, "\\S+\\/(\\S+)")[,2], "_genomic.fna.gz", sep = "")
-  remotefile <- paste(ftppath, str_match(ftppath, "\\S+\\/(\\S+)")[,2], "_genomic.fna.gz" , sep = "")
-  if (! file.exists(localfile)){
+  remotefile <- paste(ftppath, "/", str_match(ftppath, "\\S+\\/(\\S+)")[,2], "_genomic.fna.gz" , sep = "")
+  if (! file.exists(localfile) || file.info(localfile)$size == 0){
     dcmds <- append(dcmds, paste("wget -q --continue -O", localfile, remotefile))
   }
   #other annotations
@@ -174,22 +401,22 @@ checklocalfiles <- function(x) {
     ##cds file
     cdsdir <- "/media/dstore/covid19/ncbi.genbank.cds/"
     localfile <- paste(cdsdir, str_match(ftppath, "\\S+\\/(\\S+)")[,2], "_cds_from_genomic.fna.gz", sep = "")
-    remotefile <- paste(ftppath, str_match(ftppath, "\\S+\\/(\\S+)")[,2], "_cds_from_genomic.fna.gz" , sep = "")
-    if (! file.exists(localfile)){
+    remotefile <- paste(ftppath, "/", str_match(ftppath, "\\S+\\/(\\S+)")[,2], "_cds_from_genomic.fna.gz" , sep = "")
+    if (! file.exists(localfile) || file.info(localfile)$size == 0){
       dcmds <- append(dcmds, paste("wget -q --continue -O", localfile, remotefile))
     }
     ## protein file
     proteindir <- "/media/dstore/covid19/ncbi.genbank.proteins/"
     localfile <- paste(proteindir, str_match(ftppath, "\\S+\\/(\\S+)")[,2], "_protein.faa.gz", sep = "")
-    remotefile <- paste(ftppath, str_match(ftppath, "\\S+\\/(\\S+)")[,2], "_protein.faa.gz" , sep = "")
-    if (! file.exists(localfile)){
+    remotefile <- paste(ftppath, "/", str_match(ftppath, "\\S+\\/(\\S+)")[,2], "_protein.faa.gz" , sep = "")
+    if (! file.exists(localfile) || file.info(localfile)$size == 0){
       dcmds <- append(dcmds, paste("wget -q --continue -O", localfile, remotefile))
     }
     ## gff file
     gffdir <- "/media/dstore/covid19/ncbi.genbank.gff/"
     localfile <- paste(gffdir, str_match(ftppath, "\\S+\\/(\\S+)")[,2], "_genomic.gff.gz", sep = "")
-    remotefile <- paste(ftppath, str_match(ftppath, "\\S+\\/(\\S+)")[,2], "_genomic.gff.gz" , sep = "")
-    if (! file.exists(localfile)){
+    remotefile <- paste(ftppath, "/", str_match(ftppath, "\\S+\\/(\\S+)")[,2], "_genomic.gff.gz" , sep = "")
+    if (! file.exists(localfile) || file.info(localfile)$size == 0){
       dcmds <- append(dcmds, paste("wget -q --continue -O", localfile, remotefile))
     }
   }
@@ -203,20 +430,10 @@ if ( ! is_empty(x)) {
   writeLines(x, fileConn)
   close(fileConn)
 }
-ncore <- detectCores()
-system(paste("parallel -j",ncore,"</media/dstore/covid19/genbankgenomedownloadcmds.txt"))
+##following is not running. will need to figure it out.
+system("parallel -a /media/dstore/covid19/genbankgenomedownloadcmds.txt -j 8")
 
-processfasta <- function(x) {
-  ftppath <- x["ftppath_genbank"]
-  genomedir <- "/media/dstore/covid19/ncbi.genbank.genomes/"
-  fid <- str_match(ftppath, "\\S+\\/(\\S+)")[,2]
-  localfile <- paste(genomedir, fid, "_genomic.fna.gz", sep = "")
-  s <- readDNAStringSet(localfile)
-  l <- data.frame(letterFrequency(s,c("A","C","G","T")))
-  info <- data.frame(uid = as.integer(x["uid"]), gbasm = fid, seqid = as.character(names(s)), seqlen = as.integer(width(s)))
-  info <- cbind(info, l)
-  return(info)
-}
+
 ##read in genome fasta files, seqids, lengths, gc contents, number of sequences
 ginfo <- do.call("rbind", apply(y, 1, processfasta))
 y <- merge(y,ginfo %>% group_by(uid) %>% summarise(gc = sum(G,C)/sum(A,C,G,T), nseq = n()) %>% select(uid,gc,nseq), by.x = "uid", by.y = "uid")
